@@ -23,6 +23,7 @@ import com.monta.ocpp.emulator.logger.GlobalLogger
 import com.monta.ocpp.emulator.v16.connection.ConnectionManager
 import io.github.oshai.kotlinlogging.KotlinLogging
 import kotlinx.coroutines.delay
+import kotlin.math.max
 import org.jetbrains.exposed.sql.transactions.transaction
 import java.time.Instant
 import java.time.ZonedDateTime
@@ -39,21 +40,22 @@ class ChargePointManager {
     suspend fun startBootSequence(
         chargePoint: ChargePointDAO,
     ) {
-        val confirmation = ocppClientV16.asCoreProfile(chargePoint.sessionInfo).bootNotification(
-            request = BootNotificationRequest(
-                chargePointSerialNumber = chargePoint.serial,
-                firmwareVersion = chargePoint.firmware,
-                chargePointModel = chargePoint.model,
-                chargePointVendor = chargePoint.brand,
-            ),
-        )
+        while (true) {
+            val confirmation = ocppClientV16.asCoreProfile(chargePoint.sessionInfo).bootNotification(
+                request = BootNotificationRequest(
+                    chargePointSerialNumber = chargePoint.serial,
+                    firmwareVersion = chargePoint.firmware,
+                    chargePointModel = chargePoint.model,
+                    chargePointVendor = chargePoint.brand,
+                ),
+            )
 
-        transaction {
-            chargePoint.bootedAt = Instant.now()
-        }
+            transaction {
+                chargePoint.bootedAt = Instant.now()
+            }
 
-        when (confirmation.status) {
-            RegistrationStatus.Accepted -> {
+            when (confirmation.status) {
+                RegistrationStatus.Accepted -> {
                 GlobalLogger.info(chargePoint, "Boot was accepted")
 
                 chargePointService.update(chargePoint) {
@@ -76,25 +78,33 @@ class ChargePointManager {
                         ChargePointStatus.Available,
                         connector.calculateState(),
                     )
+                    }
+                }
+
+                RegistrationStatus.Pending -> {
+                    val retryDelaySeconds = max(confirmation.interval, 1)
+                    GlobalLogger.info(
+                        chargePoint,
+                        "Boot is pending, will retry in $retryDelaySeconds seconds without disconnecting",
+                    )
+                    delay(retryDelaySeconds * 1000L)
+                    continue
+                }
+
+                RegistrationStatus.Rejected -> {
+                    GlobalLogger.info(
+                        chargePoint,
+                        "Boot was rejected, will try to reconnect in ${confirmation.interval} seconds",
+                    )
+
+                    connectionManager.reconnect(
+                        chargePointId = chargePoint.idValue,
+                        delayInSeconds = confirmation.interval,
+                    )
                 }
             }
 
-            RegistrationStatus.Pending -> {
-                // Do nothing?
-                GlobalLogger.info(chargePoint, "Boot is pending, waiting for server")
-            }
-
-            RegistrationStatus.Rejected -> {
-                GlobalLogger.info(
-                    chargePoint,
-                    "Boot was rejected, will try to reconnect in ${confirmation.interval} seconds",
-                )
-
-                connectionManager.reconnect(
-                    chargePointId = chargePoint.idValue,
-                    delayInSeconds = confirmation.interval,
-                )
-            }
+            break
         }
     }
 
